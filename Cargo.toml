@@ -1,0 +1,31 @@
+[package]
+name = "multiplexed_reader"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-broadcast = "0.5.1"
+futures = "0.3.28"
+futures-util = { version = "0.3.28", features = ["io", "futures-channel", "channel"] }
+pin-project = "1.1.3"
+thiserror = "1.0.48"
+tracing = "0.1.37"
+bytes = { version = "1.4.0", path = "/home/gromneer/projects/vendor/pr-pending/bytes" }
+lazy_static = "1.4.0"
+maplit = "1.0.2"
+matches = "0.1.10"
+miette = { version = "5.8.0", features = ["backtrace", "fancy"] }
+tracing-subscriber = { version = "0.3.17", features = ["env-filter", "time"] }
+smol = "1.3.0"
+smol-potat = { version = "1.1.2", features = ["auto"] }
+
+[dev-dependencies]
+mockall = { version = "0.11.4", features = ["nightly"] }
+pretty_assertions = "1.3.0"
+rstest = "0.18.1"
+ctor = "0.2.0"
+rand = "*"
+proptest = "1.1.0"
+smol-potat = "1.1.2"
+itertools = "0.11.0"
+
