@@ -1,0 +1,6 @@
+## Building
+
+Needs a patched version of the bytes crate that I usually keep in a local vendor folder (since I was the one that patched it).
+In the Cargo.toml the line `bytes = { version = "1.4.0", path = "/home/mamaship/projects/vendor/pr-pending/bytes" }` needs to be
+changed to include the proper dir to the patched bytes crate.
+
