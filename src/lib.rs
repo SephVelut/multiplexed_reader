@@ -11,7 +11,7 @@ use thiserror::Error;
 use tracing::{error, info, warn};
 
 #[derive(Error, Diagnostic, Debug, Clone)]
-enum ReaderError<T: std::fmt::Debug> {
+pub enum ReaderError<T: std::fmt::Debug> {
     #[error("{}", self)]
     SendError(TrySendError<T>),
 
@@ -26,7 +26,7 @@ enum ReaderError<T: std::fmt::Debug> {
 }
 
 #[pin_project]
-struct LockingReader<R> {
+pub struct LockingReader<R> {
     mutex: Arc<Mutex<R>>,
     guard: Option<MutexGuardArc<R>>,
 }
@@ -41,7 +41,7 @@ impl<R> Clone for LockingReader<R> {
 }
 
 impl<R> LockingReader<R> {
-    fn new(r: R) -> Self {
+    pub fn new(r: R) -> Self {
         LockingReader { 
             mutex: Arc::new(Mutex::new(r)),
             guard: None 
@@ -70,7 +70,7 @@ where
 }
 
 #[pin_project]
-struct MultiplexedReader<R, T> {
+pub struct MultiplexedReader<R, T> {
     receiver: Receiver<T>,
     sender:   Sender<T>,
     reader:   R,
@@ -79,7 +79,7 @@ struct MultiplexedReader<R, T> {
 impl<R, T> MultiplexedReader<R, T> {
     // we create a new receiver using clone() which will place the new 
     // receiver in queue for messages sent before and after it is called.
-    fn new_receive_before(reader: R, sender: &Sender<T>, receiver: &Receiver<T>) -> Self {
+    pub fn new_receive_before(reader: R, sender: &Sender<T>, receiver: &Receiver<T>) -> Self {
         let sender  = sender.clone();
         assert!(
             !sender.is_closed(), 
@@ -101,7 +101,7 @@ impl<R, T> MultiplexedReader<R, T> {
 
     // we create a new receiver using new_receiver() which will place the
     // new receiver in queue for messages sent after it is called, not before.
-    fn new(reader: R, sender: &Sender<T>) -> Self {
+    pub fn new(reader: R, sender: &Sender<T>) -> Self {
         // todo: we technically should not be cloning a sender as a broadcast
         // channel is not the proper mechanism for the shared listener.
         // ought to use a spmc or refactor to aquire an Arc Mutex Sender
@@ -182,7 +182,7 @@ mod tests {
     use futures_util::{Stream, StreamExt};
     use itertools::Itertools;
     use mockall::mock;
-    use rand::{thread_rng, Rng};
+    use rand::{thread_rng, Rng, SeedableRng};
     use rstest::{fixture, rstest};
     use smol::lock::Mutex;
 
@@ -191,16 +191,17 @@ mod tests {
     #[rstest]
     #[timeout(Duration::from_millis(1000))]
     #[smol_potat::test]
-    async fn broadcast_to_each_other(messages: impl Iterator<Item = String> + Send + 'static + Clone) {
+    async fn broadcast_to_each_other() {
         let num_of_messages = 1000;
         let num_of_listeners = 100;
         if std::env::var("SMOL_THREADS").is_err() {
             std::env::set_var("SMOL_THREADS", "16");
         }
 
-        let reader       = LockingReader::new(bounded_reader(num_of_messages, messages.clone()));
-        let (mut tx, rx) = async_broadcast::broadcast::<ReaderMessage>(num_of_messages);
-        tx.set_await_active(true);
+        let messages = messages(num_of_messages).collect_vec();
+
+        let reader       = LockingReader::new(finite_reader(messages.clone().into_iter()));
+        let (mut tx, rx) = async_broadcast::broadcast::<ReaderMessage>(num_of_messages * 2);
         let rx = rx.deactivate();
 
         let mut listeners = Vec::with_capacity(num_of_listeners);
@@ -214,9 +215,14 @@ mod tests {
             let mut collector = Arc::clone(&collector);
             let task = smol::spawn(async move {
                 let mut sub_collector = Vec::with_capacity(num_of_messages);
+                let mut rng = rand::rngs::StdRng::from_entropy();
                 for x in 0..num_of_messages {
                     if x % 2 == 0 {
                         smol::Timer::after(std::time::Duration::from_micros(1)).await;
+                    }
+
+                    if rng.gen_bool(0.1) {
+                        smol::Timer::after(std::time::Duration::from_millis(1)).await;
                     }
 
                     sub_collector.push(listener.next().await);
@@ -234,29 +240,27 @@ mod tests {
         }
 
         let mut collector = Arc::into_inner(collector).unwrap().into_inner();
-        let events = collector
+        let collected = collector
             .into_iter()
-            .map(|event| event.unwrap().unwrap())
+            .map(|msg| msg.unwrap().unwrap())
             .counts();
-        let against = messages
-            .take(num_of_messages * num_of_listeners)
+        let against = messages.into_iter()
+            .flat_map(|item| std::iter::repeat(item).take(num_of_listeners))
             .counts();
-        pretty_assertions::assert_eq!(events, against);
+        pretty_assertions::assert_eq!(collected, against);
     }
 
     #[rstest]
     #[timeout(Duration::from_millis(1))]
     #[smol_potat::test]
-    async fn exhaust_reader_every_next() {
-        let receiver_message  = message(Some("aaaaaaaa"));
-        let sender_message    = message(Some("bbbbbbbb"));
-        let reader_messages   = messages(10, sender_message.clone());
-        let reader            = infinite_reader(reader_messages);
+    async fn exhausts_reader_before_channel() {
+        let receiver_message  = message(Some("aaaaaaaa"), 10);
+        let reader_messages   = messages(10).collect_vec();
 
         let (mut tx, rx) = async_broadcast::broadcast::<ReaderMessage>(21);
         let rx = rx.deactivate();
 
-        let reader       = LockingReader::new(reader);
+        let reader       = LockingReader::new(finite_reader(reader_messages.clone().into_iter()));
         let mut listener = MultiplexedReader::new(reader, &tx);
 
         for _ in 0..20 { tx.broadcast(receiver_message.clone()).await; }
@@ -267,8 +271,7 @@ mod tests {
         };
 
         let events = results.into_iter().counts();
-        let against = std::iter::repeat(sender_message)
-            .take(10)
+        let against = reader_messages.into_iter()
             .chain(std::iter::repeat(receiver_message).take(20))
             .counts();
 
@@ -428,12 +431,14 @@ mod tests {
         reader
     }
 
+    // used when you dont expect reader to be called more than n times. calling more than n times
+    // should panic.
     #[fixture]
-    fn bounded_reader(#[default(0)] finity: usize, mut messages: impl Iterator<Item = String> + Send + 'static) -> impl Stream<Item = String> {
-        assert!(finity > 0, "finity must be > 0, use never_reader");
+    fn bounded_reader(#[default(0)] n: usize, mut messages: impl Iterator<Item = String> + Send + 'static) -> impl Stream<Item = String> {
+        assert!(n > 0, "n must be > 0, use never_reader");
         let mut reader = MockStreamingBytes::new();
-        let mut messages = messages.take(finity);
-        if finity == 1 {
+        let mut messages = messages.take(n);
+        if n == 1 {
             reader 
                 .expect_poll_next()
                 .once()
@@ -443,7 +448,7 @@ mod tests {
         } else {
             reader 
                 .expect_poll_next()
-                .times(finity)
+                .times(n)
                 .returning(move |_| {
                     Poll::Ready(Some(messages.next().unwrap()))
                 });
@@ -470,6 +475,8 @@ mod tests {
         reader
     }
 
+    /// use when reader should signal None for end of stream. messages iterator must be bound to a
+    /// limit otherwise this reader will output infinitely.
     #[fixture]
     fn finite_reader(mut messages: impl Iterator<Item = String> + Send + 'static) -> impl Stream<Item = String> {
         let mut reader = MockStreamingBytes::new();
@@ -489,17 +496,19 @@ mod tests {
     }
 
     #[fixture]
-    fn messages(#[default(usize::MAX)] take: usize, message: String) -> impl Iterator<Item = String> + Send + 'static + Clone {
-        std::iter::repeat(message).take(take)
+    fn messages(#[default(usize::MAX)] take: usize) -> impl Iterator<Item = String> + Send + 'static + Clone {
+        std::iter::from_fn(move || {
+            Some(message(None, take))
+        }).take(take)
     }
 
     #[fixture]
-    fn message(#[default(None)] body: Option<&str>) -> String {
+    fn message(#[default(None)] body: Option<&str>, #[default(100)] max: usize) -> String {
         if let Some(body) = body {
             body.to_string()
         } else {
-            let n: u32 = thread_rng().gen();
-            format!("a message {n}")
+            let n: usize = thread_rng().gen_range(1..=max);
+            format!("{n}")
         }
     }
 }
