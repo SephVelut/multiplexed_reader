@@ -3,10 +3,10 @@
 use std::{sync::Arc, pin::Pin, task::{Context, Poll}};
 
 use async_broadcast::{Receiver, Sender, TrySendError};
-use futures_util::{Stream, FutureExt, StreamExt};
+use futures_util::{Stream, FutureExt, StreamExt, AsyncRead, pin_mut, AsyncWrite, future::BoxFuture};
 use miette::Diagnostic;
 use pin_project::pin_project;
-use smol::lock::{MutexGuardArc, Mutex};
+use smol::{lock::{MutexGuardArc, Mutex}, net::UdpSocket};
 use thiserror::Error;
 use tracing::{error, info, warn};
 
@@ -26,30 +26,30 @@ pub enum ReaderError<T: std::fmt::Debug> {
 }
 
 #[pin_project]
-pub struct LockingReader<R> {
+pub struct LockingMechanism<R> {
     mutex: Arc<Mutex<R>>,
     guard: Option<MutexGuardArc<R>>,
 }
 
-impl<R> Clone for LockingReader<R> {
+impl<R> Clone for LockingMechanism<R> {
     fn clone(&self) -> Self {
-        LockingReader { 
+        LockingMechanism { 
             mutex: self.mutex.clone(),
             guard: None 
         }
     }
 }
 
-impl<R> LockingReader<R> {
+impl<R> LockingMechanism<R> {
     pub fn new(r: R) -> Self {
-        LockingReader { 
+        LockingMechanism { 
             mutex: Arc::new(Mutex::new(r)),
             guard: None 
         }
     }
 }
 
-impl<R> Stream for LockingReader<R> 
+impl<R> Stream for LockingMechanism<R> 
 where
     R: Stream + Unpin
 {
@@ -66,6 +66,28 @@ where
         };
 
         futures::ready!(guard.poll_next_unpin(cx)).into()
+    }
+}
+
+impl<R> AsyncRead for LockingMechanism<R> 
+where
+    R: AsyncRead + Unpin
+{
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx:   &mut Context<'_>,
+        buf:  &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let mut this = self.project();
+
+        if let None = this.guard.as_mut() {
+            *this.guard = Some(futures::ready!(this.mutex.lock_arc().poll_unpin(cx)));
+        }
+
+        let guard_mut = this.guard.as_mut().unwrap();
+        let reader    = Pin::new(&mut **guard_mut);
+
+        reader.poll_read(cx, buf)
     }
 }
 
@@ -121,6 +143,61 @@ impl<R, T> MultiplexedReader<R, T> {
             receiver, 
             sender, 
             reader,
+        }
+    }
+}
+
+impl<R, T> AsyncRead for MultiplexedReader<R, T> 
+where
+    R: AsyncRead + Unpin
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx:   &mut Context<'_>,
+        buf:  &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let mut this = self.project();
+
+        let mut reader_done = false;
+        let reader = Pin::new(this.reader);
+        match reader.poll_read(cx, buf) {
+            Poll::Ready(Ok(n)) => todo!(),
+            Poll::Ready(Err(_)) => todo!(),
+            Poll::Pending => todo!(),
+            //Poll::Ready(Some(msg)) => {
+            //    assert!(!this.sender.overflow());
+            //    match this.sender.try_broadcast(msg) {
+            //        Ok(None) => (),
+            //        Err(TrySendError::Full(msg)) => {
+            //            error!("full channel encountered | msg: {:?}", msg);
+            //            return Poll::Ready(Some(Err(ReaderError::ChannelFull { msg, cap: this.sender.capacity() })))
+            //        },
+            //        Err(TrySendError::Inactive(msg)) => {
+            //            info!("inactive channel encountered | msg: {:?}", msg);
+            //            return Poll::Ready(Some(Ok(msg)))
+            //        },
+            //        Err(TrySendError::Closed(msg)) => {
+            //            warn!("closed channel encountered | msg: {:?}", msg);
+            //            return Poll::Ready(Some(Ok(msg)))
+            //        },
+            //        // overflowed
+            //        Ok(Some(msg)) => unreachable!("overflowed channel encountered | msg: {:?}", msg),
+            //    };
+            //},
+            //Poll::Ready(None) => reader_done = true,
+            //Poll::Pending => (),
+        };
+
+        match this.receiver.poll_next_unpin(cx) {
+            Poll::Ready(Some(msg)) => return Poll::Ready(Some(Ok(msg))),
+            Poll::Ready(None)      => assert!(this.receiver.is_closed()),
+            Poll::Pending          => (),
+        }
+
+        if reader_done {
+            Poll::Ready(None)
+        } else {
+            Poll::Pending
         }
     }
 }
@@ -186,7 +263,7 @@ mod tests {
     use rstest::{fixture, rstest};
     use smol::lock::Mutex;
 
-    use crate::{MultiplexedReader, ReaderError, LockingReader};
+    use crate::{MultiplexedReader, ReaderError, LockingMechanism};
 
     #[rstest]
     #[timeout(Duration::from_millis(1000))]
@@ -200,7 +277,7 @@ mod tests {
 
         let messages = messages(num_of_messages).collect_vec();
 
-        let reader       = LockingReader::new(finite_reader(messages.clone().into_iter()));
+        let reader       = LockingMechanism::new(finite_reader(messages.clone().into_iter()));
         let (mut tx, rx) = async_broadcast::broadcast::<ReaderMessage>(num_of_messages * 2);
         let rx = rx.deactivate();
 
@@ -260,7 +337,7 @@ mod tests {
         let (mut tx, rx) = async_broadcast::broadcast::<ReaderMessage>(21);
         let rx = rx.deactivate();
 
-        let reader       = LockingReader::new(finite_reader(reader_messages.clone().into_iter()));
+        let reader       = LockingMechanism::new(finite_reader(reader_messages.clone().into_iter()));
         let mut listener = MultiplexedReader::new(reader, &tx);
 
         for _ in 0..20 { tx.broadcast(receiver_message.clone()).await; }
@@ -292,7 +369,7 @@ mod tests {
         let (mut tx, mut rx) = async_broadcast::broadcast::<ReaderMessage>(2);
         let rx = rx.deactivate();
 
-        let reader       = LockingReader::new(reader);
+        let reader       = LockingMechanism::new(reader);
         let mut listener = MultiplexedReader::new(reader, &tx);
 
         listener.next().await;
@@ -307,7 +384,7 @@ mod tests {
         let reader = bounded_reader(1, messages);
         let (mut tx, mut rx) = async_broadcast::broadcast::<ReaderMessage>(1);
 
-        let reader       = LockingReader::new(reader);
+        let reader       = LockingMechanism::new(reader);
         let mut listener = MultiplexedReader::new(reader, &tx);
 
         let message = listener.next().await.unwrap().unwrap();
@@ -321,7 +398,7 @@ mod tests {
         let reader = none_reader();
         let (mut tx, mut rx) = async_broadcast::broadcast::<ReaderMessage>(1);
 
-        let reader       = LockingReader::new(reader);
+        let reader       = LockingMechanism::new(reader);
         let mut listener = MultiplexedReader::new(reader, &tx);
 
         assert!(matches!(tx.broadcast(message).await, Ok(None)));
@@ -338,7 +415,7 @@ mod tests {
         let (mut tx, mut rx) = async_broadcast::broadcast::<ReaderMessage>(1);
         assert!(matches!(tx.broadcast(message).await, Ok(None)));
 
-        let reader       = LockingReader::new(reader);
+        let reader       = LockingMechanism::new(reader);
         let mut listener = MultiplexedReader::new_receive_before(reader, &tx, &rx);
 
         let message = listener.next().await.unwrap().unwrap();
@@ -357,7 +434,7 @@ mod tests {
 
         let (mut tx, mut rx) = async_broadcast::broadcast::<ReaderMessage>(1);
 
-        let reader       = LockingReader::new(reader);
+        let reader       = LockingMechanism::new(reader);
         let mut listener = MultiplexedReader::new(reader, &tx);
 
         listener.next().await;
@@ -375,7 +452,7 @@ mod tests {
         let (mut tx, mut rx) = async_broadcast::broadcast::<ReaderMessage>(1);
         assert!(matches!(tx.broadcast(messages.first().unwrap().clone()).await, Ok(None)));
 
-        let reader       = LockingReader::new(reader);
+        let reader       = LockingMechanism::new(reader);
         let mut listener = MultiplexedReader::new(reader, &tx);
 
         let ReaderError::ChannelFull { msg, cap } = listener.next().await.unwrap().unwrap_err() else{unreachable!()};
@@ -391,7 +468,7 @@ mod tests {
         let (mut tx, mut rx) = async_broadcast::broadcast::<ReaderMessage>(1);
         let rx = rx.deactivate();
 
-        let reader       = LockingReader::new(reader);
+        let reader       = LockingMechanism::new(reader);
         let mut listener = MultiplexedReader::new(reader, &tx);
 
         let message = listener.next().await.unwrap().unwrap();
